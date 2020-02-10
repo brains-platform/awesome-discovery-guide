@@ -1,0 +1,213 @@
+# Redis游记
+
+## 缓存有哪些类型
+
+### 本地缓存
+
+进程中的内存缓存（JVM中），可以用 LRUMap 来实现，常见开源实现：Guava、Ehcache、caffeine
+
+优点：内存访问，没有远程交互开销，性能最好
+
+缺点：受限于单机容量，一般缓存较小且无法扩展；分布式场景使用涉及缓存更新问题
+
+### 分布式缓存
+
+集中是缓存，常见开源实现：Memcache、Redis
+
+优点：具有良好的水平扩展能力，对较大数据量的场景也能应付自如
+
+缺点：需要进行远程请求，性能不如本地缓存
+
+### 多级缓存
+
+为了平衡以上两种缓存的优缺点，实际业务中一般采用多级缓存，本地缓存只保存访问频率最高的部分热点数据，其他的热点数据放在分布式缓存中，本地缓存的更新通过MQ/失效时间等方式更新
+
+## 缓存淘汰策略
+
+不管是本地缓存还是分布式缓存，为了保证较高性能，都是使用内存来保存数据，由于成本和内存限制，当存储的数据超过缓存容量时，需要对缓存的数据进行剔除。
+
+一般的剔除策略有 FIFO淘汰最早数据、LRU剔除最近最少使用、和 LFU剔除最近使用频率最低的数据几种策略。
+
+* FIFO：First Input First Output，简单说就是指先进先出。
+* LRU：Least Recently Used，最近最少使用，是一种常用的页面置换算法，选择最近最久未使用的页面予以淘汰。
+* LFU：Least Frequently Used，最不经常使用策略,在一段时间内,数据被使用频次最少的,优先被淘汰。
+
+大家熟悉的LinkedHashMap中也实现了Lru算法，实现如下：
+
+```java
+public class LRUCache<K,V> extends LinkedHashMap<K,V> {
+
+  private int initialCapacity;
+
+  public LRUCache(int initialCapacity) {
+    super(initialCapacity,0.75f,true);
+    this.initialCapacity = initialCapacity;
+  }
+
+  @Override
+  protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+    return this.size() > initialCapacity;
+  }
+}
+```
+
+## Redis与Memcache对比
+
+* 数据格式支持：相比 MC，Redis 有一个非常大的优势，就是除了 K-V 之外，还支持多种数据格式，例如 list、set、sorted set、hash 等
+* 线程模型：Redis 采用单线程模式处理请求，这样做的原因有 2 个：一个是因为采用了非阻塞的异步事件处理机制；另一个是缓存数据都是内存操作 IO 时间不会太长，单线程可以避免线程上下文切换产生的代价；
+* 持久化：Redis支持持久化 不仅仅可以用作缓存，也可以用作 NoSQL 数据库
+* 分布式：MC分布式需要依赖客户端工具如xMemcached，Redis2.8引入哨兵提供主从同步机制，3.5后提供Cluster 集群部署能力，能够提供高可用服务
+* 其他：MC key 不能超过 250 个字节；value 不能超过 1M 字节；key 的最大失效时间是 30 天；
+
+## Redis基础功能
+
+### String
+
+String 类型是 Redis 中最常使用的类型，内部的实现是通过 SDS（Simple Dynamic String ）来存储的。SDS 类似于 Java 中的 ArrayList，可以通过预分配冗余空间的方式来减少内存的频繁分配。
+
+String的实际应用场景比较广泛的有：
+
+* 缓存功能：String字符串是最常用的数据类型，不仅仅是Redis，各个语言都是最基本类型，因此，利用Redis作为缓存，配合其它数据库作为存储层，利用Redis支持高并发的特点，可以大大加快系统的读写速度、以及降低后端数据库的压力；
+* 计数器：许多系统都会使用Redis作为系统的实时计数器，可以快速实现计数和查询的功能。而且最终的数据结果可以按照特定的时间落地到数据库或者其它存储介质当中进行永久保存；
+* 共享用户Session：用户重新刷新一次界面，可能需要访问一下数据进行重新登录，或者访问页面缓存Cookie，但是可以利用Redis将用户的Session集中管理，在这种模式只需要保证Redis的高可用，每次用户Session的更新和获取都可以快速完成。大大提高效率。
+
+### Hash
+
+hash类型的(key, field, value)的结构与对象的(对象id, 属性, 值)的结构相似，也可以用来存储对象。
+
+string + json也是存储对象的一种方式，那么存储对象时，到底用string + json还是用hash呢？两种存储方式的对比如下表所示。
+
+| 对比 | string + json | hash |
+| ---- | ---- | ---- |
+| 效率 | 很高 | 高 |
+| 容量 | 低 | 低 |
+| 灵活性 | **低** | 高 |
+| 序列化 | 简单 | **复杂** |
+
+当对象的某个属性需要频繁修改时，不适合用string+json，因为它不够灵活，每次修改都需要重新将整个对象序列化并赋值，如果使用hash类型，则可以针对某个属性单独修改，没有序列化，也不需要修改整个对象。当对象的某个属性不是基本类型或字符串时，使用hash类型就必须手动进行复杂序列化，比如，商品的标签是一个标签对象的列表，value想存储对象列表也还是要使用json来序列化，这样的话序列化工作就太繁琐了，不如直接用string + json的方式存储来的简单。
+
+### List
+
+有序列表，实际应用场景花样多：
+
+* 列表型的数据结构：类似粉丝列表、文章的评论列表之类
+* Lrange：返回列表中指定区间内的元素，区间以偏移量 START 和 END 指定，可以基于 List 实现分页查询
+* 简单的消息队列：生产者可以通过Lpush命令从左边插入数据，多个数据消费者，可以使用BRpop命令阻塞列表直到等待超时或发现可弹出元素为止
+
+### Set
+
+String 类型的无序集合。集合成员是唯一的，这就意味着集合中不能出现重复的数据。使用场景不多，可以使用Set数据类型跟踪一些唯一性数据
+
+* 某博客的访客IP记录
+* 标签（tag）：兴趣爱好、博客关键词
+
+### Sorted Set
+
+有序集合和集合一样也是string类型元素的集合,且不允许重复的成员。不同的是每个元素都会关联一个double类型的分数。redis正是通过分数来为集合中的成员进行从小到大的排序。有序集合的成员是唯一的,但分数(score)却可以重复。比较典型的使用场景就是多维度排行榜：时间、评分、数量等
+
+## Redis高级用法
+
+### Bitmap(需要进一步理解整理)
+
+操作String数据结构的key所存储的字符串指定偏移量上的位，返回原位置的值。
+
+活跃用户场景解析
+
+#### setbit命令
+
+设置或修改`key`上的偏移量`（offset）`的位`（value）`的值。
+
+语法：`setbit key offset value`
+返回值：指定偏移量`（offset）`原来存储的值
+
+### HyperLogLog(需要进一步理解整理)
+
+供不精确的去重计数功能，比较适合用来做大规模数据的去重统计，例如统计 UV；
+
+### Geospatial(需要进一步理解整理)
+
+可以用来保存地理位置，并作位置距离计算或者根据半径计算位置等。有没有想过用Redis来实现附近的人？或者计算最优地图路径？
+
+### pub/sub
+
+订阅发布功能，可以用作简单的消息队列。不想引入消息队列的情况下，可以用来做本地缓存的更新。
+
+### Pipeline
+
+可以批量执行一组指令，一次性返回全部结果，可以减少频繁的请求应答。而且Pipeline 实现的原理是队列，而队列的原理是时先进先出，这样就保证数据的顺序性。Pipeline 的默认的同步的个数为53个，也就是说arges中累加到53条数据时会把数据提交，类似于InfluxDB的BathPoints。pipeline中发送的每个command都会被server立即执行，一个command执行失败并不影响其他的。
+
+#### 适用场景
+
+不适合：有些系统可能对可靠性要求很高，每次操作都需要立马知道这次操作是否成功，是否数据已经写进redis了，那这种场景就不适合。
+
+适  用：批量的将数据写入redis，非主干业务可以后台执行的，允许一定比例的写入失败，后期有补偿机制就行了，比如短信群发这种场景，如果一下群发10000条，按照第一种模式去实现，那这个请求过来，要很久才能给客户端响应，这个延迟就太长了，如果客户端请求设置了超时时间5秒，那肯定就抛出异常了，而且本身群发短信要求实时性也没那么高，这时候用pipeline最好了。
+
+#### 集群下优化RedisPipeline操作（需要进一步理解整理）
+
+### Lua
+
+Redis 支持提交 Lua 脚本来执行一系列的功能。
+
+#### Redis中使用Lua的好处
+
+* 减少网络开销：可以将多个请求通过脚本的形式一次发送，减少网络时延，这一点与Pipeline部分特性重合
+* 原子操作：redis会将整个脚本作为一个整体执行，中间不会被其他命令插入。因此在编写脚本的过程中无需担心会出现竞态条件，无需使用事务。
+* 复用：客户端发送的脚步会永久存在redis中，其他客户端可以复用这一脚本而不需要使用代码完成相同的逻辑。
+
+#### lua常用命令
+
+在redis里面使用lua脚本主要用三个命令：
+
+* eval
+* evalsha
+* script load
+
+```shell
+# 语法：EVAL script numkeys key [key ...] arg [arg ...]
+# key：代表要操作的rediskey
+# arg：可以传自定义的参数
+# numkeys：用来确定key有几个
+# script：就是你写的lua脚本
+# lua脚本里面使用KEYS[1]和ARGV[1]来获取传递的key和arg
+redis> eval "return {KEYS[1],KEYS[2],ARGV[1],ARGV[2]}" 2 key1 key2 first second
+1) "key1"
+2) "key2"
+3) "first"
+4) "second"
+```
+
+在用eval命令的时候，可以注意到每次都要把执行的脚本发送过去，这样势必会有一定的网络开销，所以redis对lua脚本做了缓存，通过script load 和 evalsha实现
+script load命令会在redis服务器缓存你的lua脚本，并且返回脚本内容的SHA1校验和，然后通过evalsha 传递SHA1校验和来找到服务器缓存的脚本进行调用，这两个命令的格式以及使用方式如下：
+
+```shell
+# 语法：SCRIPT LOAD script
+# 语法：EVALSHA sha1 numkeys key [key ...] arg [arg ...]
+redis> SCRIPT LOAD "return {KEYS[1],KEYS[2],ARGV[1],ARGV[2]}"
+"232fd51614574cf0867b83d384a5e898cfd24e5a"
+
+redis> EVALSHA 232fd51614574cf0867b83d384a5e898cfd24e5a  2 key1 key2 first second
+1) "key1"
+2) "key2"
+3) "first"
+4) "second"
+```
+
+#### lua Debug
+
+在运行lua的eval,加上-ldb即可开启debug功能,debug只支持eval命令，如下：
+
+`./redis-cli --ldb --eval /tmp/script.lua mykey somekey , arg1 arg2`
+
+redis lua script debug命令与jdk jdb有些类似，但命令更加丰富。详细命令可以通过`lua debugger> help`了解。
+
+### Redis客户端与服务端交互过程
+
+## 更多典型使用案例/场景
+
+### 红包秒杀
+
+#### 实现思路
+
+可使用lua优化合并红包派发与红包数量扣减部分逻辑，不是因为lua的原子性，lua能减少网络开销
+
+#### 部分核心代码
